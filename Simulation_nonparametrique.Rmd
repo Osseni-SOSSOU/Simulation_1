@@ -1,0 +1,922 @@
+---
+title: "onparametric"
+author: "SOSSOU Osséni"
+date: "2026-06-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, warning = FALSE, message = FALSE}
+library(ggplot2)
+library(gridExtra)
+library(dplyr)
+library(tidyr)
+library(fda)
+library(splines)
+library(splines2)
+```
+
+```{r}
+# ---- Paramètres temporels ----------------------------------
+annees  <- seq(2000, 2026, by = 1)   # 27 années d'observation
+n_grid  <- length(annees)
+t_grid  <- (annees - 2000) / 26      # normalisé sur [0,1]
+D       <- 3                          # Jeunes | Actifs | Seniors
+dt      <- 1 / (n_grid - 1)
+noms_tranches <- c("Jeunes (0-14 ans)", "Actifs (15-64 ans)", "Seniors (65+)")
+```
+
+```{r}
+# Base B-spline (nbasis à calibrer, ordre 4 = cubique)
+nbasis <- 8
+basisobj <- create.bspline.basis(rangeval = c(0,1), nbasis = nbasis, norder = 4)
+```
+
+$$d_{A}(\boldsymbol{f},\boldsymbol{g})=\left(\sum_{d=1}^{D}\int_{\mathcal{I}}\left(\log \left\{\frac{f_{d}(t)}{\tilde{f}(t)}\right\}-\log \left\{\frac{g_{d}(t)}{\tilde{g}(t)}\right\}\right)^{2} dt\right)^{1 / 2}$$
+
+```{r}
+# Distance between two functional compositions
+dist_aitchison_func <- function(f, g) {
+  #' @param f et g les fonction dont on veux calculer leur distance
+  #' @return la distance entre f et g
+  
+  D <- nrow(f)
+  n_points <- ncol(f)
+  
+  integrand <- numeric(n_points)
+  
+  for(j in 1:n_points) {
+    f_geom <- exp(mean(log(f[,j])))
+    g_geom <- exp(mean(log(g[,j])))
+    
+    term <- 0
+    for(d in 1:D) {
+      diff_log <- log(f[d,j]/f_geom) - log(g[d,j]/g_geom)
+      term <- term + diff_log^2
+      }
+    integrand[j] <- term
+    }
+  
+  # approximate the integral using the trapezoidal rule 
+  dis <- pracma::trapz(t_grid, integrand)
+  
+  return(sqrt(dis))
+}
+```
+
+SIMULATION DES DONNEES
+
+ Générateur de profils démographiques réalistes
+ On simule 3 types de trajectoires démographiques :
+ 
+  Type A - "Vieillissement rapide"  (Seniors croissants, Jeunes décroissants)
+  Type B - "Transition stable"      (structure peu changeante)
+  Type C - "Pays jeune"             (Jeunes dominants, peu de seniors)
+  
+ Indice de dépendance démographique total (IDT)
+ 
+ $$IDT(X) = \int_{T}  \frac{X_{jeunes}(t) + X_{seniors}(t)}{X_{actifs}(t)}dt$$
+```{r}
+sim_data_demo <- function(n) {
+  #' @param n la taille de l'échantillon
+  #' @param noise_sd l'écart-type du bruit des courbes
+  #' @return les courbe demographique et IDT
+  
+  X <- array(0, c(D, n_grid, n))
+  fonction_m <- numeric(n)
+  IDT <- numeric(n)
+  
+  Xfd <- list(n)
+  
+  for (i in 1:n) {
+    type <- sample(c("A","B","C"), 1, prob = c(0.35, 0.40, 0.25))
+    raw  <- matrix(0, D, n_grid)
+
+    if (type == "A") {          # Vieillissement rapide
+      raw[1,] <- 0.10 - 0.04*t_grid + rnorm(n_grid, 0, 0.04)  # Jeunes déclinants
+      raw[2,] <- 0.50 - 0.02*t_grid + rnorm(n_grid, 0, 0.04)  # Actifs stables-déclinants
+      raw[3,] <- 0.40 + 0.06*t_grid + rnorm(n_grid, 0, 0.04)  # Seniors croissants
+    } 
+    else if (type == "B") {    # Transition stable
+      raw[1,] <- 0.20 - 0.01*t_grid + rnorm(n_grid, 0, 0.04)
+      raw[2,] <- 0.65 + 0.00*t_grid + rnorm(n_grid, 0, 0.04)
+      raw[3,] <- 0.15 + 0.01*t_grid + rnorm(n_grid, 0, 0.04)
+    } 
+    else {                     # Pays jeune
+      raw[1,] <- 0.40 - 0.02*t_grid + rnorm(n_grid, 0, 0.04)  # Jeunes encore élevés
+      raw[2,] <- 0.55 + 0.02*t_grid + rnorm(n_grid, 0, 0.04)  # Actifs croissants
+      raw[3,] <- 0.05 + 0.00*t_grid + rnorm(n_grid, 0, 0.04)  # Seniors faibles
+    }
+
+    # Softmax pour garantir f_d(t) > 0 et sum_d f_d(t) = 1
+    raw_exp <- exp(raw * 4)   # ×4 pour accentuer la séparation des types
+    
+    for (j in 1:n_grid) X[,j,i] <- raw_exp[,j] / sum(raw_exp[,j])
+    
+    #########
+    
+    # Lissage par moindres carrés pénalisés (roughness penalty)
+    fdParobj <- fdPar(basisobj, Lfdobj = 2, lambda = 1e-4)  # pénalité sur la dérivée 2nde
+    
+    # X[,,i] : matrice D x n_grid (courbes x points)
+    
+    X_demo <- t(X[,,i])
+    smooth_res <- smooth.basis(argvals = t_grid, y = X_demo, fdParobj = fdParobj)
+    Xfd[[i]] <- smooth_res$fd  # objet fonctionnel lissé
+    
+    #########
+    
+    # approximate the integral using the trapezoidal rule 
+    integrand <- (X[1, , i] + X[3, , i]) / pmax(X[2, , i], 1e-6)
+    fonction_m[i] <- pracma::trapz(t_grid, integrand)
+    IDT[i] <- fonction_m[i] + rnorm(1, 0, 0.05)
+  }
+  
+  return(list(
+    X = X,
+    Xfd = Xfd,
+    Y = IDT,
+    fonction_m = fonction_m
+  ))
+}
+```
+
+
+```{r}
+set.seed(2026)
+# Palette cohérente
+pal3 <- c("#E63946", "#457B9D", "#2A9D8F")
+
+## Fig 1 — profils démographiques simulés
+dt_ex <- sim_data_demo(6)
+
+# Xex est maintenant un objet fd multivarié (D composantes, n courbes)
+# Structure attendue : une liste de 6 objets fd (un par composante),
+# ou un seul objet fd avec coefs de dimension D x nbasis x n 
+
+Xfd_ex <- dt_ex$Xfd    # objet(s) fd
+IDT_ex <- vapply(1:6, function(i) round(dt_ex$Y[i], 2), numeric(1))
+
+# Évaluation de chaque composante fonctionnelle sur la grille
+# Cas où Xfd_ex est une LISTE de 6 objets fd (un par tranche d'âge)
+
+Xex <- array(0, dim = c( D, n_grid, 6))
+for (i in 1:6) {
+  Xex[, , i] <- t(eval.fd(t_grid, Xfd_ex[[i]]))   # n_grid x n
+}
+
+dfex <- do.call(rbind, lapply(1:6, function(i)
+  data.frame(annee = rep(annees, D),
+             part  = as.vector(t(Xex[,,i])) * 100,
+             tranche = factor(rep(noms_tranches, each = n_grid), levels = noms_tranches),
+             pays  = sprintf("Pays %d avec IDT=%.2f", i, IDT_ex[i]))))
+
+p1 <- ggplot(dfex, aes(annee, part, colour = tranche, fill = tranche)) +
+  geom_area(alpha = 0.25, position = "identity") +
+  geom_line(linewidth = .9) +
+  facet_wrap(~pays, nrow = 2) +
+  scale_colour_manual(values = pal3) + scale_fill_manual(values = pal3) +
+  scale_x_continuous(breaks = c(2000, 2010, 2020, 2026)) +
+  labs(title = "Profils démographiques simulés: Répartition par tranche d'age",
+       subtitle = "Chaque courbe X_i(t) est une composition fonctionnelle",
+       x = "Année", y = "Part de la population (%)", colour = "", fill = "") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "bottom")
+p1
+```
+
+
+L'ESTIMATEUR
+
+```{r}
+# noyau d’Epanechnikov
+
+#K_epan  <- function(u) ifelse(abs(u) <= 1, 0.75*(1 - u^2), 0)
+
+K_epan  <- function(u) ifelse(u > 0 & u < 1, 1 - u^2, 0)
+
+
+# Estimateur à noyanu
+Kernel_estimator <- function(df, X_new, h){ 
+  #' @param df les donnés demographique et IDT
+  #' @param X_new la courbe demographique dont on veux estimer son IDT
+  #' @param h la fenêtre
+  #' @return l'estimation de l'IDT pour X_new
+  
+  Y <- df$Y
+  X <- df$X
+  dist <- vapply(1:dim(X)[3], function(i) dist_aitchison_func(X_new, X[,,i]), numeric(1))
+  
+  w <- K_epan(dist/h) # Calcul des poid
+  s <- sum(w,na.rm = TRUE)
+  
+  est <- if(s == 0) 0 else sum(w*Y)/s 
+  return(est)
+}
+
+#' Estimateur à noyau sur un échantillon de test complet
+
+Kernel_estimator_test <- function(dt_train, dt_test, h) {
+  #' @param dt_test  données à prédire
+  #' @param dt_train données d'apprentissage
+  #' @param h             Fenêtre
+  #' @return Vecteur de prédictions
+  
+  n_test <- dim(dt_test$X)[3]
+  pred <- numeric(n_test)
+  
+  for (i in 1:n_test) {
+    pred[i] <- Kernel_estimator(dt_train, dt_test$X[, , i], h)
+  }
+  return(pred)
+}
+```
+
+ GRILLE DE FENETRES PAR PLUS PROCHES VOISINS
+ 
+ hk = rayon de la boule centrée en X contenant exactement k voisins
+ On définit une grille globale : pour chaque k ∈ {1,...,32}, on prend la médiane sur tous les X du test
+
+```{r}
+fenetres_knn <- function(dt_train, X_test, K_max = 32) {
+  #' @param X_test  Courbe de test 
+  #' @param dt_train Courbes d'apprentissage 
+  #' @param K_max    Nombre max de fenêtres
+  #' @return Vecteur de K_max fenêtres
+  
+  n_train <- dim(dt_train$X)[3]
+  
+  # Calcul du vecteur distance de chaque Xr par rapport aux X_train
+  dists_i <- vapply(1:n_train, function(j) dist_aitchison_func(X_test, dt_train$X[,,j]), numeric(1)) 
+  
+  dists_tries <- sort(dists_i) #ordonnée les distances
+    
+    # hk  = distance au k-ième plus proche voisin +12
+    
+      h_grille <- dists_tries[1:32]
+  
+  return(h_grille)
+}
+```
+
+DISTRIBUTION BOOTSTRAP G* (deux masses de Dirac)
+
+Construisez une séquence de résidus re-échantillonnés de manière à ce que chaque $\hat{\epsilon}$ soit tiré d'une distribution $G^{*}_{i}$ qui est la somme de deux distributions de Dirac :
+
+$$G^{*}_{i} = \frac{5+\sqrt{5}}{10}\delta_{\frac{\hat{\epsilon}_{i}(1-\sqrt{5})}{2}} +  \frac{5-\sqrt{5}}{10}\delta_{\frac{\hat{\epsilon}_{i}(1+\sqrt{5})}{2}}$$ 
+
+La fonction inverse de la fonction de repartion est données par:
+$$F^{-1}(q) =\begin{cases} 
+\frac{1-\sqrt{5}}{2}\hat{\epsilon}_{i} \qquad \text{si} \qquad q \leqslant \frac{5+\sqrt{5}}{10} \quad \text{ou} \quad q > \frac{5-\sqrt{5}}{10} \\
+\frac{1+\sqrt{5}}{2}\hat{\epsilon}_{i} \quad\text{sinon} 
+\end{cases}$$
+
+
+```{r}
+#Tire un résidu bootstrap eps_star selon G_star pour un résidu eps_hat donné
+
+tirer_residu_bootstrap <- function(eps_hat) {
+  #' @param eps_hat Résidu estimé (scalaire)
+  #' @return Résidu bootstrap eps_star (scalaire)
+  
+  
+  # Les deux masses
+  masse1 <- (5 + sqrt(5)) / 10  # Probabilité du premier point
+  masse2 <- (5 - sqrt(5)) / 10  # Probabilité du deuxième point
+  
+  val1 <- eps_hat * (1 - sqrt(5)) / 2  # Premier point de support
+  val2 <- eps_hat * (1 + sqrt(5)) / 2  # Deuxième point de support
+  
+  # Tirage de Bernoulli
+  
+  q <- runif(1)
+  
+  if(is.na(eps_hat)){
+    return(NA)
+  }
+  else{
+    if ((q <= masse1 & eps_hat > 0) | (q >= masse2 & eps_hat < 0)) {
+      return(val1)
+    }
+    else{
+      return(val2)
+    }
+  }
+}
+
+# Génère un vecteur de résidus bootstrap pour tout l'échantillon
+
+generer_residus_bootstrap <- function(residus) {
+  #' @param residus Vecteur des résidus eps_hat
+  #' @return Vecteur des résidus bootstrap esp_star
+  #' 
+  sapply(residus, tirer_residu_bootstrap)
+}
+```
+
+PROCEDURE DE BOOTSTRAP SAUVAGE FONCTIONNEL 
+
+Pour une fenêtre h fixée et un point X :
+   1. Calculer $\hat{m}$ et résidus $\hat{\epsilon}$ avec fenêtre h
+   2. Calculer $\tilde{m}$ avec fenêtre g (pilote)
+   3. NB fois :
+      a. Tirer $\epsilon^{*}_{i}$ suivant $G^{*}$
+      b. $Y^{*}_{i} = \widetilde{m}(X_{i}) + \epsilon^{*}_{i}$
+      c. Calculer $\hat{m}^{*}$ sur $( X_{i},  Y^{*}_{i})$
+   4. MSE_bootstrap(h) = moyenne de $(\hat{m}^{*}(X) - \tilde{m}(X)))^{2}$
+
+
+```{r}
+# Calcule la MSE bootstrap pour une fenêtre h et un ensemble de points χ
+
+mse_bootstrap_h <- function(dt_train, X_test, h_cible, h_pilote) {
+  #' @param h_cible     Fenêtre à évaluer (vecteur de n_test)
+  #' @param h_pilote    Fenêtre pilote g pour construire r_tilde (scalaire)
+  #' @param dt_train    données d'apprentissage
+  #' @param X_test     données de test
+  #' @return MSE bootstrap moyenne sur les X de test
+  
+  # Étape i : résidus bootstrap
+    m_hat <- Kernel_estimator_test(dt_train, dt_train, h_cible)
+    
+    # Résidus
+      residus <- dt_train$Y - m_hat
+      
+    eps_star <- generer_residus_bootstrap(residus)
+  
+  # Étape ii : réponses bootstrap
+  
+    # --- m_tilde : estimateur pilote avec fenêtre g ---
+    m_tilde <- Kernel_estimator_test(dt_train, dt_train, h_pilote)
+    
+    # --- m_tilde pour les points de test ---
+    m_tilde_X_test <- Kernel_estimator(dt_train, X_test, h_pilote)
+    
+    # échantiollons bootstrapé
+    Y_star <- m_tilde + eps_star
+    dt_star <- list(X = dt_train$X, Y = Y_star)
+    
+    # Étape iii : m_hat_star(X) sur (X, Y_star) avec fenêtre h_cible
+    m_hat_star <- Kernel_estimator(dt_star, X_test, h_cible)
+    
+  # Erreur bootstrap pour X
+    erreurs_boot <- (m_hat_star - m_tilde_X_test)^2
+  
+  # MSE bootstrap = moyenne sur les X
+  return(erreurs_boot)
+}
+```
+
+
+```{r}
+# Calcul de mse par bootstrap sauvage fonctionnel
+
+mse_bootstrap_fenetres <- function(n_train, n_test, K_max = 32, NB = 100) {
+  #' @param dt_train    données d'apprentissage
+  #' @param dt_test     données de test
+  #' @param K_max       Nombre max de fenêtres
+  #' @param NB          Nombre de réplications bootstrap
+  #' @return Liste : h_opt (fenêtre choisie), mse_boot (vecteur des MSE) et mse_boot_opt
+  
+  cat("  Calcul MSE bootstrap pour", K_max, "fenêtres...\n")
+  
+  erreurs_boot <- array(NA, dim = c(n_test, K_max, NB))
+  
+  # --- NB réplications bootstrap ---
+  
+  for (b in 1:NB) {
+    dt_train <- sim_data_demo(n_train)
+    dt_test <- sim_data_demo(n_test)
+      
+    erreur_h_boot <- matrix(NA, nrow = n_test, ncol = K_max)
+    
+    for (t in 1:n_test) {
+      h_grille <- fenetres_knn(dt_train, dt_test$X[ , , t], K_max)
+        
+      for (h in 1:K_max) {
+        erreur_h_boot[t, h] <- mse_bootstrap_h(dt_train, dt_test$X[ , , t], h_grille[h], h_pilote = 0.5)
+      }
+    }
+    erreurs_boot[, , b] <- erreur_h_boot
+    if (b  %% 10 == 0) cat("    Réplication", b, "/", NB, "traitée\n")
+  }
+  
+  
+  erreurs_rep_boot <- rowMeans(erreurs_boot, dims = 2)
+  
+  mse_boot <- apply(erreurs_rep_boot, 2, mean)
+  
+  k_opt  <- which.min(mse_boot)
+  mse_opt_boot <- mse_boot[k_opt]
+  
+  return(list(mse_boot = mse_boot, mse_opt_boot = mse_opt_boot))
+}
+```
+
+
+
+```{r}
+mse_vraie_fenetres <- function(n_train, n_test, K_max, n_repl = 100){
+    #' @param dt_train    données d'apprentissage
+    #' @param dt_test     données de test
+    #' @param K_max       Nombre max de fenêtres
+    #' @param n_repl      Nombre de replications
+    #' @return Liste de résultats
+  
+  # ----------- MSE VRAIE pour chaque h -------------
+    
+    cat("  Calcul MSE VRAI pour", K_max, "fenêtres...\n")
+  
+    erreurs <- array(NA, dim = c(n_test, K_max, n_repl))
+    
+    for (r in 1:n_repl) {
+      
+      dt_train <- sim_data_demo(n_train)
+      dt_test <- sim_data_demo(n_test)
+      
+      erreur_h <- matrix(NA, nrow = n_test, ncol = K_max)
+      
+      for (t in 1:n_test) {
+        h_grille <- fenetres_knn(dt_train, dt_test$X[ , , t], K_max)
+        
+        for (h in 1:K_max) {
+        pred <- Kernel_estimator(dt_train, dt_test$X[ , , t], h_grille[h])
+        erreur_h[t, h] <- (dt_test$fonction_m[t] - pred)^2
+        }
+      }
+      erreurs[, , r] <- erreur_h
+      if (r  %% 10 == 0) cat("    Réplication", r, "/", n_repl, "traitée\n")
+    }
+    
+    erreurs_rep <- rowMeans(erreurs, dims = 2)
+  
+  mse_vraie <- apply(erreurs_rep, 2, mean)
+  
+  k_opt  <- which.min(mse_vraie)
+  mse_opt_vraie <- mse_vraie[k_opt]
+
+  
+  return(list(mse_vraie = mse_vraie, mse_opt_vraie = mse_opt_vraie))
+}
+```
+
+```{r}
+Mont_carlo <- function(J, n_train = 100, n_test = 50, K_max = 32, n_repl = 50){
+  mse_vraies_matrix <- matrix(NA, nrow = J, ncol = K_max)
+  
+  for (j in 1:J) {
+    cat("--- Experience", j, "/", J, "---\n")
+    
+    Res_j <- mse_vraie_fenetres (n_train, n_test, K_max, n_repl)
+    
+    mse_vraies_matrix[j, ] <- Res_j$mse_vraie
+  }
+  
+  return(mse_vraies_matrix = mse_vraies_matrix)
+}
+
+Expe <- Mont_carlo(25)
+
+saveRDS(Expe, "Exper.rds")
+```
+
+```{r}
+resultats_Exper <- readRDS("Exper.rds")
+```
+
+```{r}
+tracer_figure1 <- function(resultats, n_show = 25) {
+  K_max <- 32#resultats$K_max
+  J     <- nrow(resultats_Exper)
+  idx   <- sample(1:J, min(n_show, J))
+  
+  # Données pour MSE vraie
+  df_vrai <- data.frame(
+    k     = rep(1:K_max, times = length(idx)),
+    MSE   = as.vector(t(resultats_Exper[idx, ])),
+    exp   = rep(idx, each = K_max)
+  )
+  
+  p1 <- ggplot(df_vrai, aes(x = k, y = MSE, group = exp, color = factor(exp))) +
+    geom_line(alpha = 0.5, linewidth = 0.4) +
+#    stat_summary(aes(group = 1), fun = mean, geom = "line",
+#                 color = "black", linewidth = 1.5) +
+    scale_color_manual(values = colorRampPalette(c("#74add1","#d73027"))(length(idx))) +
+    labs(title = "MSE Vraie", x = "Nombre de voisins (k)", y = "MSE") +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "none",
+          plot.title = element_text(face = "bold", hjust = 0.5))
+  
+  
+  p1
+}
+
+tracer_figure1(resultats_Exper, n_show = 25)
+resultats_Exper[4,]
+```
+
+
+
+
+
+UNE EXPERIENCE COMPLETE (une répétition Monte Carlo)
+
+Effectue une expérience complète :
+  - Génère les données
+  - Calcule la MSE vraie et la MSE bootstrap pour chaque fenêtre
+  - Retourne les deux courbes d'erreur et les MSE optimales
+  
+```{r}
+une_experience <- function(n_train = 100, n_test = 50, K_max = 32, NB = 100) {
+  #' @param n_train  Taille de l'échantillon d'apprentissage (100)
+  #' @param n_test   Taille de l'échantillon de test (50)
+  #' @param K_max    Nombre de fenêtres candidates (32)
+  #' @param NB       Nombre de réplications (100)
+  #' @return Liste de résultats
+  
+  # ----------- MSE VRAIE pour chaque h -------------
+  res_vraie <- mse_vraie_fenetres(n_train,
+                                      n_test,
+                                      K_max = K_max,
+                                      n_repl = NB
+                                  )
+  
+  # --------- MSE BOOTSTRAP pour chaque h --------
+  res_boot  <- mse_bootstrap_fenetres(n_train,
+                                        n_test,
+                                        K_max = K_max,
+                                        NB = NB
+                                      )
+  
+  return(list(
+    mse_vraie    = res_vraie$mse_vraie,
+    mse_boot     = res_boot$mse_boot,
+    mse_opt_vraie = res_vraie$mse_opt_vraie,
+    mse_opt_boot = res_boot$mse_opt_boot
+  ))
+}
+```
+
+```{r}
+# ======================================================================
+# 11. SIMULATION MONTE CARLO COMPLETE (J répétitions)
+# ======================================================================
+
+lancer_simulation <- function(J = 25, n_train = 100, n_test = 50, K_max = 32, NB = 50) {
+  #' @param J        Nombre d'experience
+  #' @param n_train  Taille de l'échantillon d'apprentissage (100)
+  #' @param n_test   Taille de l'échantillon de test (50)
+  #' @param K_max    Nombre de fenêtres candidates (32)
+  #' @param NB       Nombre de réplications (100)
+  #' @return         Liste de résultats
+  
+  
+  # Stockage des résultats
+  mse_vraies_matrix <- matrix(NA, nrow = J, ncol = K_max)
+  mse_boot_matrix   <- matrix(NA, nrow = J, ncol = K_max)
+  mse_opt_vraie_vec  <- numeric(J)
+  mse_opt_boot_vec  <- numeric(J)
+  
+  cat("=== DEBUT DE LA SIMULATION MONTE CARLO ===\n")
+  cat("J =", J, "| n_train =", n_train, "| n_test =", n_test,
+      "| K_max =", K_max, "| NB =", NB, "\n\n")
+  
+  for (j in 1:J) {
+    cat("--- Experience", j, "/", J, "---\n")
+    
+    res_j <- une_experience(
+                              n_train = n_train,
+                              n_test  = n_test,
+                              K_max   = K_max,
+                              NB      = NB
+                            )
+
+    
+    mse_vraies_matrix[j, ] <- res_j$mse_vraie
+    mse_boot_matrix[j, ]   <- res_j$mse_boot
+    mse_opt_vraie_vec[j]    <- res_j$mse_opt_vraie
+    mse_opt_boot_vec[j]    <- res_j$mse_opt_boot
+    
+    cat("  MSE optimale vraie   :", round(res_j$mse_opt_vraie, 4), "\n")
+    cat("  MSE avec h* bootstrap :", round(res_j$mse_opt_boot, 4), "\n\n")
+  }
+  
+  cat("=== RESULTATS FINAUX ===\n")
+  cat("MSE optimale vraie    - Moyenne:", round(mean(mse_opt_vraie_vec, na.rm = TRUE), 4),
+      "| Variance:", round(var(mse_opt_vrai_vec, na.rm = TRUE), 4), "\n")
+  cat("MSE bootstrap h*      - Moyenne:", round(mean(mse_opt_boot_vec, na.rm = TRUE), 4),
+      "| Variance:", round(var(mse_opt_boot_vec, na.rm = TRUE), 4), "\n")
+  
+  return(list(
+    mse_vraies_matrix = mse_vraies_matrix,
+    mse_boot_matrix   = mse_boot_matrix,
+    mse_opt_vraie_vec  = mse_opt_vraie_vec,
+    mse_opt_boot_vec  = mse_opt_boot_vec
+  ))
+}
+```
+
+
+
+```{r}
+set.seed(2026)
+PARAMS <- list(
+  J       = 30,    # Répétitions Monte Carlo
+  n_train = 100,   # Taille échantillon train
+  n_test  = 50,    # Taille échantillon test 
+  K_max   = 32,    # Nombre de fenêtres     
+  NB      = 100     # Réplications bootstrap   
+)
+
+# --- Simulation Monte Carlo ---
+resultats <- lancer_simulation(
+  J       = PARAMS$J,
+  n_train = PARAMS$n_train,
+  n_test  = PARAMS$n_test,
+  K_max   = PARAMS$K_max,
+  NB      = PARAMS$NB
+)
+
+#saveRDS(resultats, "resultats_Nonparam.rds")
+```
+
+```{r}
+resultats_Nonparam <- readRDS("resultats_SimulationNonparam.rds")
+```
+
+
+Figure : MSE vraie et MSE bootstrap
+
+```{r}
+tracer_figure1 <- function(resultats, n_show = 25) {
+  K_max <- 32#resultats$K_max
+  J     <- nrow(resultats$mse_vraies_matrix)
+  idx   <- sample(1:J, min(n_show, J))
+  
+  # Données pour MSE vraie
+  df_vrai <- data.frame(
+    k     = rep(1:K_max, times = length(idx)),
+    MSE   = as.vector(t(resultats$mse_vraies_matrix[idx, ])),
+    exp   = rep(idx, each = K_max)
+  )
+  
+  # Données pour MSE bootstrap
+  df_boot <- data.frame(
+    k     = rep(1:K_max, times = length(idx)),
+    MSE   = as.vector(t(resultats$mse_boot_matrix[idx, ])),
+    exp   = rep(idx, each = K_max)
+  )
+  
+  p1 <- ggplot(df_vrai, aes(x = k, y = MSE, group = exp, color = factor(exp))) +
+    geom_line(alpha = 0.5, linewidth = 0.4) +
+    stat_summary(aes(group = 1), fun = mean, geom = "line",
+                 color = "black", linewidth = 1.5) +
+    scale_color_manual(values = colorRampPalette(c("#74add1","#d73027"))(length(idx))) +
+    labs(title = "MSE Vraie", x = "Nombre de voisins (k)", y = "MSE") +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "none",
+          plot.title = element_text(face = "bold", hjust = 0.5))
+  
+  p2 <- ggplot(df_boot, aes(x = k, y = MSE, group = exp, color = factor(exp))) +
+    geom_line(alpha = 0.5, linewidth = 0.4) +
+    stat_summary(aes(group = 1), fun = mean, geom = "line",
+                 color = "black", linewidth = 1.5) +
+    scale_color_manual(values = colorRampPalette(c("#74add1","#d73027"))(length(idx))) +
+    labs(title = "MSE Bootstrap", x = "Nombre de voisins (k)", y = "MSE Bootstrap") +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "none",
+          plot.title = element_text(face = "bold", hjust = 0.5))
+  
+  grid.arrange(p1, p2, ncol = 2,
+               top = "Figure : Erreurs vraie et bootstrap en fonction de h")
+}
+
+tracer_figure1(resultats_Nonparam, n_show = 25)
+```
+
+Figure : Densités des MSE optimale vraie et bootstrappée
+
+```{r}
+tracer_figure3 <- function(resultats) {
+  mse_vrai <- resultats$mse_opt_vrai_vec
+  mse_boot <- resultats$mse_opt_boot_vec
+  
+  m_v <- round(mean(mse_vrai), 2)
+  v_v <- round(var(mse_vrai),  4)
+  m_b <- round(mean(mse_boot), 2)
+  v_b <- round(var(mse_boot),  4)
+  
+  df_vrai <- data.frame(MSE = mse_vrai, type = paste0("Optimale (oracle)\nmoy=",m_v," var=",v_v))
+  df_boot <- data.frame(MSE = mse_boot, type = paste0("Bootstrap h*\nmoy=",m_b," var=",v_b))
+  df_all  <- rbind(df_vrai, df_boot)
+  
+  ggplot(df_all, aes(x = MSE, fill = type, color = type)) +
+    geom_density(alpha = 0.4, linewidth = 1) +
+    scale_fill_manual(values  = c("#2166ac", "#d6604d")) +
+    scale_color_manual(values = c("#2166ac", "#d6604d")) +
+    labs(
+      title    = "Figure  : Distribution des MSE — oracle vs. bootstrap",
+      x        = "MSE",
+      y        = "Densité estimée",
+      fill     = NULL, color = NULL
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      #legend.position  = element_rect(fill = "white", color = "grey80"),
+      legend.position  = "bottom",
+      plot.title       = element_text(face = "bold"),
+      panel.grid.minor = element_blank()
+    )
+}
+
+tracer_figure3(resultats_Nonparam)
+```
+
+```{r}
+set.seed(2026)
+cat("\n=== Normalité asymptotique ===\n")
+n_norm <- 100; n_repl <- 1000
+dt_ref_norm  <- sim_data_demo(1)
+h_norm <- max(resultats_Nonparam$h_opt_vrai)
+
+
+raw_lst <- lapply(1:n_repl, function(r) {
+  dt_norm <- sim_data_demo(n_norm)
+  Ytr <- dt_norm$Y + rnorm(n_norm, 0, 2)
+  
+  dists <- vapply(1:dim(dt_norm$X)[3], function(i) dist_aitchison_func(dt_ref_norm$X[,,1], dt_norm$X[,,i]), numeric(1)) # calcul de la distance entre X* et les X observés
+  
+  Fh  <- mean(dists <= h_norm); if(Fh < 0.02) return(NULL)
+  # La répétition est rejetté si Fh < 0,02 (moins de 2% d'observation dans la boule)
+  
+  dt <- list(Y=Ytr, X=dt_norm$X)
+  mh <- Kernel_estimator(dt, dt_ref_norm$X[,,1], h_norm)
+    
+  list(mhat=mh, Fh=Fh)
+})
+valid <- Filter(Negate(is.null), raw_lst) # filtrer les répétition valide
+cat(sprintf("Répétitions valides : %d / %d\n", length(valid), n_repl))
+
+mhats <- vapply(valid, `[[`, numeric(1), "mhat") # Extrait le chant des estimateur
+Fhs   <- vapply(valid, `[[`, numeric(1), "Fh")  # Extrait le chant des Fn
+
+B_n   <- mean(mhats) - dt_ref_norm$Y    # Calcul du biais
+
+var_est <- var(sqrt(n_norm * Fhs) * (mhats - dt_ref_norm$Y)) # Calcul de la variance
+
+zvals   <- sqrt(n_norm * Fhs) * (mhats - dt_ref_norm$Y - B_n) / sqrt(var_est)
+
+cat(sprintf("IDT reference m(X*) = %.4f\n", dt_ref_norm$Y))
+cat(sprintf("Biais B_n  = %.5f\n", B_n))
+cat(sprintf("Moyenne zvals = %.4f  |  Variance zvals = %.4f\n", mean(zvals), var(zvals)))
+ks_p <- ks.test(zvals, "pnorm", 0, 1)$p.value
+cat(sprintf("Test KS p-valeur = %.4f\n", ks_p))
+
+saveRDS(zvals, "zvals.rds")
+```
+
+
+```{r}
+resultats_zvals <- readRDS("zvals.rds")
+```
+
+```{r}
+## Fig 4 — normalité asymptotique
+dfz  <- data.frame(z = resultats_zvals)
+ks_p <- ks.test(dfz, "pnorm", 0, 1)$p.value
+ks_l <- sprintf("Test KS : p = %.3f\n(ne rejette pas N(0,1))", ks_p)
+
+p4a <- ggplot(dfz, aes(z)) +
+  geom_histogram(aes(y=after_stat(density)),
+                 fill="#457B9D", alpha=.75, colour="white") +
+  stat_function(fun=dnorm, args=list(0,1), colour="#E63946", linewidth=1.3) +
+  annotate("text", x=1.6, y=max(dfz)*.1,
+           label=ks_l, colour="#E63946", size=3.5, fontface="italic", hjust=0) +
+  labs(title   = "Distribution de la statistique normalisée",
+       x="z", y="Densité") +
+  theme_minimal(base_size=11) + 
+  theme(plot.title=element_text(face="bold"))
+
+p4b <- ggplot(dfz, aes(sample=z)) +
+  stat_qq(colour="#457B9D", alpha=.5, size=1.5) +
+  stat_qq_line(colour="#E63946", linewidth=1.1) +
+  labs(title   = "Q-Q plot vs N(0,1)  (Corollaire 1)",
+       subtitle = "Alignement sur la droite rouge = normalité asymptotique",
+       x="Quantiles théoriques N(0,1)", y="Quantiles empiriques") +
+  theme_minimal(base_size=11) + 
+  theme(plot.title=element_text(face="bold"))
+
+p4a ; p4b
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+set.seed(2026)
+cat("\n=== Normalité asymptotique ===\n")
+n_norm <- 100; n_repl <- 10000
+dt_ref_norm  <- sim_data_demo(1)
+
+
+raw_lst <- lapply(1:n_repl, function(r) {
+  
+  dt_norm <- sim_data_demo(n_norm)
+  h_norm <- max(fenetres_knn(dt_norm,dt_ref_norm$X[,,1]))
+  
+  dists <- vapply(1:dim(dt_norm$X)[3], function(i) dist_aitchison_func(dt_ref_norm$X[,,1], dt_norm$X[,,i]), numeric(1)) # calcul de la distance entre X* et les X observés
+  
+  Fh  <- mean(dists <= h_norm); if(Fh < 0.02) return(NULL)
+  # La répétition est rejetté si Fh < 0,02 (moins de 2% d'observation dans la boule)
+  
+  mh <- Kernel_estimator(dt_norm, dt_ref_norm$X[,,1], h_norm)
+    
+  list(mhat=mh, Fh=Fh)
+})
+valid <- Filter(Negate(is.null), raw_lst) # filtrer les répétition valide
+cat(sprintf("Répétitions valides : %d / %d\n", length(valid), n_repl))
+
+mhats <- vapply(valid, `[[`, numeric(1), "mhat") # Extrait le chant des estimateur
+Fhs   <- vapply(valid, `[[`, numeric(1), "Fh")  # Extrait le chant des Fn
+
+B_n   <- mean(mhats) - dt_ref_norm$Y    # Calcul du biais
+
+var_est <- var(sqrt(n_norm * Fhs) * (mhats - dt_ref_norm$Y)) # Calcul de la variance
+
+zvals   <- sqrt(n_norm * Fhs) * (mhats - dt_ref_norm$Y - B_n) / sqrt(var_est)
+
+cat(sprintf("IDT reference m(X*) = %.4f\n", dt_ref_norm$Y))
+cat(sprintf("Biais B_n  = %.5f\n", B_n))
+cat(sprintf("Moyenne zvals = %.4f  |  Variance zvals = %.4f\n", mean(zvals), var(zvals)))
+ks_p <- ks.test(zvals, "pnorm", 0, 1)$p.value
+cat(sprintf("Test KS p-valeur = %.4f\n", ks_p))
+
+#saveRDS(zvals, "zvals.rds")
+```
+
+
+```{r}
+resultats_zvals <- zvals
+```
+
+```{r}
+## Fig 4 — normalité asymptotique
+dfz  <- data.frame(z = resultats_zvals)
+ks_p <- ks.test(dfz, "pnorm", 0, 1)$p.value
+ks_l <- sprintf("Test KS : p = %.3f\n(ne rejette pas N(0,1))", ks_p)
+
+p4a <- ggplot(dfz, aes(z)) +
+  geom_histogram(aes(y=after_stat(density)),
+                 fill="#457B9D", alpha=.75, colour="white") +
+  stat_function(fun=dnorm, args=list(0,1), colour="#E63946", linewidth=1.3) +
+  annotate("text", x=1.6, y=max(dfz)*.1,
+           label=ks_l, colour="#E63946", size=3.5, fontface="italic", hjust=0) +
+  labs(title   = "Distribution de la statistique normalisée",
+       x="z", y="Densité") +
+  theme_minimal(base_size=11) + 
+  theme(plot.title=element_text(face="bold"))
+
+p4b <- ggplot(dfz, aes(sample=z)) +
+  stat_qq(colour="#457B9D", alpha=.5, size=1.5) +
+  stat_qq_line(colour="#E63946", linewidth=1.1) +
+  labs(title   = "Q-Q plot vs N(0,1)  (Corollaire 1)",
+       subtitle = "Alignement sur la droite rouge = normalité asymptotique",
+       x="Quantiles théoriques N(0,1)", y="Quantiles empiriques") +
+  theme_minimal(base_size=11) + 
+  theme(plot.title=element_text(face="bold"))
+
+p4a ; p4b
+```
+
+
+
